@@ -4,8 +4,8 @@
 #   - channel_major_perm() itself (pymindy/dataset/create_synth_data.py)
 #   - the structural pattern it produces in create_synth_MINDy/HMMINDy's
 #     output (pymindy/dataset/create_synth_data.py)
-#   - that hmmindy_core.py's strided-indexing (W_mask splitting, the .W
-#     property reconstruction) agrees with that same channel-major layout
+#   - that hmmindy_core.py's full W/mask and its Wee/Wei/Wie/Wii slices
+#     agree with that same channel-major layout
 #     (pymindy/training/hmmindy_core.py)
 #
 # Channel-major convention under test: index 2*c is the excitatory
@@ -190,20 +190,17 @@ def test_gamma_shares_w_zero_pattern_in_channel_major():
 
 
 # --------------------------------------------------------------------------
-# hmmindy_core.py: strided indexing agrees with create_synth_data.py's
+# hmmindy_core.py: W and its E/I slices agree with create_synth_data.py's
 # channel-major convention
 # --------------------------------------------------------------------------
 
-def test_hmmindy_core_init_w_mask_splitting_matches_channel_major_truth(synth_mindy_model):
-    # HMMINDyCore.init() splits W_mask via strided indexing
-    # (W_mask[0::nPop,0::nPop], W_mask[1::nPop,0::nPop]). Verify that lines
-    # up with the same channel-major W produced by create_synth_data.py.
+def test_hmmindy_core_init_w_mask_matches_channel_major_truth(synth_mindy_model):
+    # HMMINDyCore.init() stores the full N x N mask; the E/I slices of the
+    # initial W must respect the same channel-major pattern as the truth.
     nChan, nPop, model = synth_mindy_model
     W_mask = np.sign(model["Params"]["W"])
     E = np.arange(0, nPop * nChan, nPop)
     I = np.arange(1, nPop * nChan, nPop)
-    expected_mask_ee = W_mask[np.ix_(E, E)]
-    expected_mask_ei = W_mask[np.ix_(I, E)]
 
     H = np.zeros((nChan, nPop * nChan))
     Q = np.eye(nPop * nChan)
@@ -211,43 +208,35 @@ def test_hmmindy_core_init_w_mask_splitting_matches_channel_major_truth(synth_mi
 
     core = HMMINDyCore.init(H, Q, R, n_HMM=2, W_mask=W_mask, device="cpu")
 
-    np.testing.assert_array_equal(core._W_mask_ee.numpy(), expected_mask_ee)
-    np.testing.assert_array_equal(core._W_mask_ei.numpy(), expected_mask_ei)
+    np.testing.assert_array_equal(core._W_mask.numpy(), W_mask != 0)
+    W_fit = core.W.detach().numpy()
+    assert np.all(W_fit[W_mask == 0] == 0)
+    assert np.all(W_fit[:, E] >= 0) and np.all(W_fit[:, I] <= 0)
+    np.testing.assert_array_equal(core.Wee.detach().numpy() != 0, W_fit[np.ix_(E, E)] != 0)
+    np.testing.assert_array_equal(core.Wei.detach().numpy() != 0, W_fit[np.ix_(I, E)] != 0)
 
 
 def test_hmmindy_core_w_property_roundtrips_channel_major_truth(synth_mindy_model):
-    # Decompose a real channel-major W (from create_synth_data.py) into
-    # Wee/Wei/Wie/Wii the same way HMMINDyCore.init() would, feed those into
-    # a core, and confirm the .W property's interleaved reconstruction
-    # reproduces the original channel-major matrix exactly. This pins down
-    # that both files agree on the same channel-major layout.
+    # Load a real channel-major W (from create_synth_data.py) into a core as
+    # |W| magnitudes, and confirm the .W property reintroduces the E/I signs
+    # and that the Wee/Wei/Wie/Wii slices match the old nPop=2 layout.
     nChan, nPop, model = synth_mindy_model
     W_true = model["Params"]["W"]
     E = np.arange(0, nPop * nChan, nPop)
     I = np.arange(1, nPop * nChan, nPop)
 
-    Wee_true = W_true[np.ix_(E, E)]
-    Wei_true = W_true[np.ix_(I, E)]
-    Wie_true = -np.diag(W_true[np.ix_(E, I)])
-    Wii_true = -np.diag(W_true[np.ix_(I, I)])
+    H = np.zeros((nChan, nPop * nChan))
+    Q = np.eye(nPop * nChan)
+    R = np.eye(nChan)
+    core = HMMINDyCore.init(H, Q, R, n_HMM=2, W_mask=np.sign(W_true), device="cpu")
+    with torch.no_grad():
+        core._W_raw.copy_(torch.from_numpy(np.abs(W_true)).float())
 
-    # These should already be nonnegative by construction (Wee/Wei/Wie/Wii
-    # are stored as magnitudes; sign is reintroduced by the .W property).
-    assert np.all(Wee_true >= 0)
-    assert np.all(Wei_true >= 0)
-    assert np.all(Wie_true >= 0)
-    assert np.all(Wii_true >= 0)
-
-    core = HMMINDyCore.__new__(HMMINDyCore)
-    core._H = torch.zeros(nChan, nPop * nChan)
-    core._Wee = torch.from_numpy(Wee_true).float()
-    core._Wei = torch.from_numpy(Wei_true).float()
-    core._Wie = torch.from_numpy(Wie_true).float()
-    core._Wii = torch.from_numpy(Wii_true).float()
-
-    W_reconstructed = core.W.numpy()
-
-    np.testing.assert_allclose(W_reconstructed, W_true, atol=1e-5)
+    np.testing.assert_allclose(core.W.detach().numpy(), W_true, atol=1e-5)
+    np.testing.assert_allclose(core.Wee.detach().numpy(), W_true[np.ix_(E, E)], atol=1e-5)
+    np.testing.assert_allclose(core.Wei.detach().numpy(), W_true[np.ix_(I, E)], atol=1e-5)
+    np.testing.assert_allclose(core.Wie.detach().numpy(), -np.diag(W_true[np.ix_(E, I)]), atol=1e-5)
+    np.testing.assert_allclose(core.Wii.detach().numpy(), -np.diag(W_true[np.ix_(I, I)]), atol=1e-5)
 
 
 @pytest.mark.xfail(

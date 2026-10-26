@@ -1,7 +1,9 @@
+import numpy as np
 import torch
 from torch import nn
 from torch.func import jacrev
 from .abstract_core import AbstractMINDyCore
+from ..dataset.create_synth_data import pop_layout, build_W_mask
 
 class HMMINDyCore(AbstractMINDyCore):
     # The core pyMINDy model for neural dynamics, with HMM modulation.
@@ -10,38 +12,17 @@ class HMMINDyCore(AbstractMINDyCore):
     #       The number of data channels
     #   n_HMM : int
     #       The number of HMM states
-    #   Wee : torch.tensor
-    #       The excitatory-to-excitatory connectivity weight matrix
-    #   Wei : torch.tensor
-    #       The excitatory-to-inhibitory connectivity weight matrix
-    #   Wie : torch.tensor
-    #       The inhibitory-to-excitatory connectivity weight matrix
-    #   Wii : torch.tensor
-    #       The inhibitory-to-inhibitory connectivity weight matrix
-    #   Gammaee : torch.tensor
-    #       The excitatory-to-excitatory modulation connectivity weight matrix
-    #   Gammaei : torch.tensor
-    #       The excitatory-to-inhibitory modulation connectivity weight matrix
-    #   Gammaie : torch.tensor
-    #       The inhibitory-to-excitatory modulation connectivity weight matrix
-    #   Gammaii : torch.tensor
-    #       The inhibitory-to-inhibitory modulation connectivity weight matrix
-    #   Se : torch.tensor
-    #       The scaling factor for the excitatory firing function
-    #   Si : torch.tensor
-    #       The scaling factor for the inhibitory firing function
-    #   Ve : torch.tensor
-    #       The bias term for the excitatory firing function
-    #   Vi : torch.tensor
-    #       The bias term for the inhibitory firing function
-    #   De : torch.tensor
-    #       The decay rate for the excitatory neurons
-    #   Di : torch.tensor
-    #       The decay rate for the inhibitory neurons
-    #   Ce : torch.tensor
-    #       The bias term for the excitatory neurons
-    #   Ci : torch.tensor
-    #       The bias term for the inhibitory neurons
+    #   W : torch.tensor
+    #       The full connectivity matrix (N x N, N = nChan*nPop), channel-major.
+    #       Built as W_mask * |W_raw| * pop_type, so E columns are >= 0 and I columns <= 0
+    #   Gamma : torch.tensor
+    #       The modulation matrices (N x N x n_HMM), W_mask * |G1 @ G2| for each state
+    #   D, C, S, V : torch.tensor
+    #       Per-population decay, bias, activation slope and activation offset (N,)
+    #   Wee, Wei, Wie, Wii, Gammaee, Gammaei, Gammaie, Gammaii : torch.tensor
+    #       Read-only E/I slices of W and Gamma (see the properties for shapes)
+    #   Se, Si, Ve, Vi, De, Di, Ce, Ci : torch.tensor
+    #       Read-only E/I slices of S, V, D and C
     #   H : torch.tensor
     #       The observation (lead-field) matrix
     #   Q : torch.tensor
@@ -90,8 +71,10 @@ class HMMINDyCore(AbstractMINDyCore):
     #       The observation noise covariance matrix
     #   n_HMM : int
     #       The number of HMM states
-    #   W_mask : torch.tensor
-    #       The mask specifying which sort of connection each element of W is; if 1, no mask on excitatory parameters 
+    #   W_mask : np.ndarray
+    #       Full (N x N) channel-major mask of allowed connections (nonzero = allowed),
+    #       e.g. np.sign(W_truth). If 1, every channel pair is connected (E sources
+    #       project everywhere, I sources stay local to their channel)
     #   Gamma_rank : int
     #       rank of the Gamma matrices
     #   fix_Wmask : bool
@@ -121,7 +104,7 @@ class HMMINDyCore(AbstractMINDyCore):
     #   rand_scale : float
     #       The scale for the random initialization of the parameters
     #   nPop : int
-    #       The number of neural populations per channel (E + I, so must be 2)
+    #       The number of neural populations per channel (even, >= 2; see pop_layout())
     #
     # Returns:
     #   HMMINDyCore : AbstractMINDyCore
@@ -139,45 +122,30 @@ class HMMINDyCore(AbstractMINDyCore):
                            "Gammaii_min": 0}
 
         # BEGIN JAKE CODE
-        # nPop is passed in from the caller (e.g. the notebook's hyperparameters)
-        # The model is parameterized as E/I pairs (Wee/Wei/Wie/Wii), so only nPop=2 is supported
-        if nPop != 2:
-            raise ValueError(f"HMMINDyCore only supports nPop=2 (E/I populations), got nPop={nPop}")
+        # nPop is passed in from the caller (e.g. the notebook's hyperparameters).
+        # pop_layout() validates it and defines the channel-major E/I layout.
         n_chan = H.shape[1] // nPop # number of channels (H's population axis is channel-major)
         if H.shape[1] != nPop * n_chan or H.shape[0] != n_chan:
             raise ValueError(f"H must have shape (nChan, nPop*nChan); got {H.shape} with nPop={nPop}")
+        pop_type, is_E, E_idx, I_idx, chan_of = pop_layout(n_chan, nPop)
+        N = nPop * n_chan
 
-        # Convert the W mask to torch (if mask is specified)
-        # W_mask is channel-major: [chan0_E, chan0_I, chan1_E, chan1_I, ...], so the
-        # E and I populations of a given block are the even/odd indices, not the
-        # first/second half.
-        # (use strided indexing so that Gamma pulls EE/II diagonal sub-blocks instead of half slicing)
-        if (W_mask != 1).any():
-            W_mask_ee = torch.from_numpy(W_mask[0::nPop,0::nPop])
-            W_mask_ei = torch.from_numpy(W_mask[1::nPop,0::nPop])
-            W_mask_ee = W_mask_ee.type(torch.int32).to(device)
-            W_mask_ei = W_mask_ei.type(torch.int32).to(device)
-        else:
-            W_mask_ee = 1
-            W_mask_ei = 1
+        # Full N x N mask of allowed connections (W_mask=1 means all channel pairs connected)
+        if np.isscalar(W_mask):
+            W_mask = build_W_mask(n_chan, nPop, np.ones((n_chan, n_chan)))
+        if W_mask.shape != (N, N):
+            raise ValueError(f"W_mask must have shape ({N}, {N}); got {W_mask.shape}")
+        W_mask = torch.from_numpy(np.asarray(W_mask) != 0).type(torch.float).to(device)
 
+        # Generate random W magnitudes (sign comes from pop_type in the W property)
+        W_raw = W_mask * torch.rand(N, N, dtype=torch.float, device=device) * rand_scale
+
+        # Generate per-population parameters D, C, S, & V
+        S = torch.where(torch.from_numpy(is_E), Se_fixed_value, Si_fixed_value).type(torch.float).to(device)
+        V = torch.where(torch.from_numpy(is_E), Ve_fixed_value, Vi_fixed_value).type(torch.float).to(device)
+        D = torch.rand(N, dtype=torch.float, device=device) * rand_scale
+        C = torch.rand(N, dtype=torch.float, device=device) * rand_scale
         # END JAKE CODE
-
-        # Generate random W matrix, section by section
-        Wee = W_mask_ee * torch.rand(n_chan, n_chan, dtype=torch.float, device=device) * rand_scale
-        Wei = W_mask_ei * torch.rand(n_chan, n_chan, dtype=torch.float, device=device) * rand_scale
-        Wie = torch.rand(n_chan, dtype=torch.float, device=device) * rand_scale
-        Wii = torch.rand(n_chan, dtype=torch.float, device=device) * rand_scale
-
-        # Generate excitatory and inhibitory components of parameters D, C, S, & V
-        Se = Se_fixed_value * torch.ones(n_chan, dtype=torch.float, device=device)
-        Si = Si_fixed_value * torch.ones(n_chan, dtype=torch.float, device=device)
-        Ve = Ve_fixed_value * torch.ones(n_chan, dtype=torch.float, device=device)
-        Vi = Vi_fixed_value * torch.ones(n_chan, dtype=torch.float, device=device)
-        De = torch.rand(n_chan, dtype=torch.float, device=device) * rand_scale
-        Di = torch.rand(n_chan, dtype=torch.float, device=device) * rand_scale
-        Ce = torch.rand(n_chan, dtype=torch.float, device=device) * rand_scale
-        Ci = torch.rand(n_chan, dtype=torch.float, device=device) * rand_scale
         
         # Convert Q, R, and H to torch
         _Q = torch.from_numpy(Q).type(torch.float).to(device)
@@ -188,12 +156,12 @@ class HMMINDyCore(AbstractMINDyCore):
         mu0 = torch.tensor([0.95])
         sigma0_u = torch.tensor([0.45])
         sigma0_n = torch.tensor([0.05])
-        
-        Gamma = torch.empty((nPop*n_chan,nPop*n_chan,n_HMM))
-        Gammaek1 = torch.empty((n_chan,Gamma_rank,n_HMM))
-        Gammaek2 = torch.empty((Gamma_rank,n_chan,n_HMM))
-        Gammaik1 = torch.empty((Gamma_rank,n_chan,n_HMM))
-        Gammaik2 = torch.empty((Gamma_rank,n_chan,n_HMM))
+
+        # BEGIN JAKE CODE
+        # Gamma[:,:,k] = W_mask * |G1[:,:,k] @ G2[:,:,k]| (G1: target factors, G2: source factors)
+        G1 = torch.empty((N,Gamma_rank,n_HMM))
+        G2 = torch.empty((Gamma_rank,N,n_HMM))
+        # END JAKE CODE
 
         # Generate one Gamma for each HMM state
         for i in range(n_HMM):
@@ -202,27 +170,18 @@ class HMMINDyCore(AbstractMINDyCore):
             mu_i = torch.normal(mu0, 0.1).item()
             if is_normal:
                 sigma_i = abs(torch.normal(sigma0_n, torch.tensor([0.01])))
-                Gammak = torch.normal(mu0 * torch.ones((nPop*n_chan, Gamma_rank)), sigma0_n * torch.ones(nPop*n_chan, Gamma_rank))
+                Gammak = torch.normal(mu0 * torch.ones((N, Gamma_rank)), sigma0_n * torch.ones(N, Gamma_rank))
             else:
                 sigma_i = abs(torch.normal(sigma0_u).item())
-                Gammak = torch.FloatTensor(size=(nPop*n_chan,Gamma_rank)).uniform_(mu_i-(sigma_i/2), mu_i + (sigma_i/2))
-            Gamma_full = Gammak @ Gammak.T
-            
-            Gamma[:,:,i] = torch.from_numpy(abs(W_mask)).type(torch.float) * Gamma_full
+                Gammak = torch.FloatTensor(size=(N,Gamma_rank)).uniform_(mu_i-(sigma_i/2), mu_i + (sigma_i/2))
 
             # BEGIN JAKE CODE
-            # Gamma is channel-major like W_mask, so pull the EE/II sub-blocks via
-            # strided indexing rather than the first/second half.
-            Gammaek1[:,:,i] = torch.sqrt(torch.diag(Gamma[0::nPop,0::nPop,i]))[:,None]
-            Gammaek2[:,:,i] = torch.sqrt(torch.diag(Gamma[0::nPop,0::nPop,i]))[None,:]
-            Gammaik1[:,:,i] = torch.sqrt(torch.diag(Gamma[1::nPop,1::nPop,i]))[None,:]
-            Gammaik2[:,:,i] = torch.sqrt(torch.diag(Gamma[1::nPop,1::nPop,i]))[None,:]
+            G1[:,:,i] = Gammak
+            G2[:,:,i] = Gammak.T
             # END JAKE CODE
 
-        Gammaek1 = Gammaek1.type(torch.float).to(device)
-        Gammaek2 = Gammaek2.type(torch.float).to(device)
-        Gammaik1 = Gammaik1.type(torch.float).to(device)
-        Gammaik2 = Gammaik2.type(torch.float).to(device)
+        G1 = G1.type(torch.float).to(device)
+        G2 = G2.type(torch.float).to(device)
 
         # Generate Hidden Markov Model
         HMM = dict()
@@ -231,31 +190,28 @@ class HMMINDyCore(AbstractMINDyCore):
         HMM['A'] = HMM['A'].type(torch.float).to(device)
         HMM['pi'] = ((1/n_HMM) * torch.ones((n_HMM,))).type(torch.float).to(device)
 
-        return HMMINDyCore(n_chan, n_HMM, Wee, Wei, Wie, Wii, Gammaek1, Gammaik1, 
-                           Gammaek2, Gammaik2, Se, Si, Ve, Vi, De, Di, Ce, Ci, _H,
-                           _Q, _R, fix_Wmask, fix_Se, fix_Si, fix_Ve, fix_Vi,
-                           W_mask_ee, W_mask_ei, param_range, HMM, device)
+        return HMMINDyCore(n_chan, n_HMM, nPop, W_raw, G1, G2, S, V, D, C, _H, _Q, _R,
+                           fix_Wmask, fix_Se, fix_Si, fix_Ve, fix_Vi, W_mask,
+                           param_range, HMM, device)
 
-    def __init__(self, n_chan, n_HMM, Wee, Wei, Wie, Wii, Gammaek1, Gammaik1, Gammaek2,
-                 Gammaik2, Se, Si, Ve, Vi, De, Di, Ce, Ci, H, Q, R, fix_Wmask, fix_Se,
-                 fix_Si, fix_Ve, fix_Vi, W_mask_ee, W_mask_ei, param_range, HMM, device):
+    def __init__(self, n_chan, n_HMM, nPop, W_raw, G1, G2, S, V, D, C, H, Q, R, fix_Wmask,
+                 fix_Se, fix_Si, fix_Ve, fix_Vi, W_mask, param_range, HMM, device):
         super(HMMINDyCore, self).__init__()
 
+        # BEGIN JAKE CODE
         self._device = device
-        self._Wee = nn.Parameter(Wee)
-        self._Wei = nn.Parameter(Wei)
-        self._Wie = nn.Parameter(Wie)
-        self._Wii = nn.Parameter(Wii)
-        self._W_mask_ee = W_mask_ee
-        self._W_mask_ei = W_mask_ei
-        self._Gammaek1 = nn.Parameter(Gammaek1)
-        self._Gammaik1 = nn.Parameter(Gammaik1)
-        self._Gammaek2 = nn.Parameter(Gammaek2)
-        self._Gammaik2 = nn.Parameter(Gammaik2)
-        self._De = nn.Parameter(De)
-        self._Di = nn.Parameter(Di)
-        self._Ce = nn.Parameter(Ce)
-        self._Ci = nn.Parameter(Ci)
+        pop_type, is_E, E_idx, I_idx, chan_of = pop_layout(n_chan, nPop)
+        self.register_buffer('_pop_type', torch.from_numpy(pop_type).type(torch.float).to(device))
+        self.register_buffer('_is_E', torch.from_numpy(is_E).to(device))
+        self.register_buffer('_W_mask', W_mask)
+        self._E_idx = torch.from_numpy(E_idx).to(device)
+        self._I_idx = torch.from_numpy(I_idx).to(device)
+
+        self._W_raw = nn.Parameter(W_raw)
+        self._G1 = nn.Parameter(G1)
+        self._G2 = nn.Parameter(G2)
+        self._D = nn.Parameter(D)
+        self._C = nn.Parameter(C)
         self._Gamma_ind = 0
         self._H = H
         self._Q = Q
@@ -267,25 +223,31 @@ class HMMINDyCore(AbstractMINDyCore):
         self.fix_Ve = fix_Ve
         self.fix_Vi = fix_Vi
 
-        if fix_Se:
-            self._Se = Se
+        # S and V are single per-population vectors; when only one of the E/I
+        # halves is fixed, the fixed half is read from the initial values instead
+        # of the parameter (so it receives no gradient)
+        self.register_buffer('_S_fix', torch.where(self._is_E, fix_Se, fix_Si))
+        self.register_buffer('_V_fix', torch.where(self._is_E, fix_Ve, fix_Vi))
+        self.register_buffer('_S0', S.clone())
+        self.register_buffer('_V0', V.clone())
+        if fix_Se and fix_Si:
+            self._S = S
         else:
-            self._Se = nn.Parameter(Se)
-        if fix_Si:
-            self._Si = Si
+            self._S = nn.Parameter(S)
+        if fix_Ve and fix_Vi:
+            self._V = V
         else:
-            self._Si = nn.Parameter(Si)
-
-        if fix_Ve:
-            self._Ve = Ve
-        else:
-            self._Ve = nn.Parameter(Ve)
-        if fix_Vi:
-            self._Vi = Vi
-        else:
-            self._Vi = nn.Parameter(Vi)
+            self._V = nn.Parameter(V)
 
         self.param_range = param_range
+        # Per-population ranges for D (always) and S (only used when S is trainable)
+        self.register_buffer('_D_min', torch.where(self._is_E, param_range['De_min'], param_range['Di_min']).type(torch.float))
+        self.register_buffer('_D_max', torch.where(self._is_E, param_range['De_max'], param_range['Di_max']).type(torch.float))
+        if not (fix_Se and fix_Si):
+            self.register_buffer('_S_min', torch.where(self._is_E, param_range.get('Se_min', -torch.inf), param_range.get('Si_min', -torch.inf)).type(torch.float))
+            self.register_buffer('_S_max', torch.where(self._is_E, param_range.get('Se_max', torch.inf), param_range.get('Si_max', torch.inf)).type(torch.float))
+        # END JAKE CODE
+
         with torch.no_grad():
             self.clamp_params()
 
@@ -302,21 +264,25 @@ class HMMINDyCore(AbstractMINDyCore):
     # Returns:
     #   None
     def clamp_params(self):
-        if not self.fix_Se:
-            self._Se.data.clamp_(self.param_range['Se_min'], self.param_range['Se_max'])
-        if not self.fix_Si:
-            self._Si.data.clamp_(self.param_range['Si_min'], self.param_range['Si_max'])
+        # BEGIN JAKE CODE
+        if not (self.fix_Se and self.fix_Si):
+            self._S.data = torch.clamp(self._S.data, self._S_min, self._S_max)
         if not self.fix_Wmask:
-            off_diag = torch.ones((self.n_pop, self.n_pop), dtype=torch.float, device=self.device) - torch.eye(self.n_pop)
-            tmp = torch.quantile(off_diag * (self.W), 0.75)
-            Wmask = torch.eye(self.n_pop) + off_diag * self.W>=tmp
-            # BEGIN JAKE CODE
+            # Re-pick the channel mask from the current cross-channel E->any strengths:
+            # keep the top 25% of off-diagonal channel pairs (symmetrized, as in
+            # build_chan_mask()), plus every channel's own local block
+            n_chan = self.n_chan
             nPop = self.n_pop_per_chan
-            self._W_mask_ee = Wmask[0::nPop, 0::nPop]
-            self._W_mask_ei = Wmask[1::nPop, 0::nPop]
-            # END JAKE CODE
-        self._Wee.data = self._W_mask_ee * self._Wee.data
-        self._Wei.data = self._W_mask_ei * self._Wei.data
+            W_E = torch.abs(self._W_raw.data) * self._is_E[None,:]
+            chan_strength = W_E.reshape(n_chan, nPop, n_chan, nPop).sum(dim=(1,3))
+            chan_strength = chan_strength + chan_strength.T
+            off_diag = ~torch.eye(n_chan, dtype=torch.bool, device=self.device)
+            tmp = torch.quantile(chan_strength[off_diag], 0.75)
+            chan_mask = ((chan_strength >= tmp) & off_diag).cpu().numpy()
+            W_mask = build_W_mask(n_chan, nPop, chan_mask)
+            self._W_mask = torch.from_numpy(W_mask).type(torch.float).to(self.device)
+        self._W_raw.data = self._W_mask * self._W_raw.data
+        # END JAKE CODE
 
     ###### func_F() ######
     # func_F() computes the next state (x)
@@ -332,31 +298,16 @@ class HMMINDyCore(AbstractMINDyCore):
     #       The next state
     def func_F(self, x, mod_ind):
         # BEGIN JAKE CODE
-        # Get current state. x is channel-major ([chan0_E, chan0_I, chan1_E, chan1_I, ...]),
-        # so the E/I populations are the even/odd indices, not the first/second half.
-        nPop = self.n_pop_per_chan
-        xe = x[0::nPop]
-        xi = x[1::nPop]
-        # END JAKE CODE
+        # x_next = (W * Gamma_k) @ tanh(S*x + V) + D*x + C, all in channel-major order
+        # (index_select rather than [:,:,mod_ind] so this also works under vmap)
+        N = self.n_pop
+        mod_ind = torch.as_tensor(mod_ind, device=self.device).reshape(1)
+        G1k = torch.index_select(self.G1, 2, mod_ind).reshape(N, -1)
+        G2k = torch.index_select(self.G2, 2, mod_ind).reshape(-1, N)
+        Gammak = self._W_mask * torch.abs(G1k @ G2k)
 
-        # Apply activation function, tanh(Sx + V)
-        activation_e = self.activation_function(self.Se * xe + self.Ve)
-        activation_i = self.activation_function(self.Si * xi + self.Vi)
-
-        # Get Gamma matrix (the properties build all modulation states at once)
-        Gammaee = self.Gammaee
-        Gammaei = self.Gammaei
-        Gammaie = self.Gammaie
-        Gammaii = self.Gammaii
-
-        # Calculate next x
-        xe_next = (self.Wee * torch.squeeze(Gammaee[:,:,mod_ind])) @ activation_e - (self.Wie * torch.squeeze(Gammaie[:,mod_ind])) * activation_i + self.De * xe + self.Ce
-        xi_next = (self.Wei * torch.squeeze(Gammaei[:,:,mod_ind])) @ activation_e - (self.Wii * torch.squeeze(Gammaii[:,mod_ind])) * activation_i + self.Di * xi + self.Ci
-
-        # BEGIN JAKE CODE
-        # Interleave back into channel-major order ([chan0_E, chan0_I, chan1_E, chan1_I, ...])
-        # to match x's layout, rather than concatenating into blocks.
-        x_next = torch.stack([xe_next, xi_next], dim=-1).flatten()
+        activation = self.activation_function(self.S * x + self.V)
+        x_next = (self.W * Gammak) @ activation + self.D * x + self.C
         # END JAKE CODE
 
         return x_next
@@ -468,132 +419,137 @@ class HMMINDyCore(AbstractMINDyCore):
     def R(self):
         return self._R
 
-    @property
-    def Wee(self):
-        return torch.abs(self._Wee)
-
-    @property
-    def Wei(self):
-        return torch.abs(self._Wei)
-
-    @property
-    def Wie(self):
-        return torch.abs(self._Wie)
-
-    @property
-    def Wii(self):
-        return torch.abs(self._Wii)
-
-    @property
-    def Gammaek1(self):
-        return torch.abs(self._Gammaek1)
-
-    @property
-    def Gammaik1(self):
-        return torch.abs(self._Gammaik1)
-
-    @property
-    def Gammaek2(self):
-        return torch.abs(self._Gammaek2)
-
-    @property
-    def Gammaik2(self):
-        return torch.abs(self._Gammaik2)
-
-    @property
-    def Gammaee(self):
-        return torch.abs(self._W_mask_ee[:,:,None] * torch.einsum('ijk,jlk->ilk', \
-                self.Gammaek1, self.Gammaek2))
-
-    @property
-    def Gammaei(self):
-        return torch.abs(self._W_mask_ei[:,:,None] * torch.einsum('jik,jlk->ilk', \
-                self.Gammaik1, self.Gammaek2))
-
-    @property
-    def Gammaie(self):
-        return torch.abs(torch.squeeze(self.Gammaek1) * torch.squeeze(self.Gammaik2))
-
-    @property
-    def Gammaii(self):
-        return torch.abs(torch.squeeze(self.Gammaik1) * torch.squeeze(self.Gammaik2))
-
-    @property
-    def Se(self):
-        return self._Se
-
-    @property
-    def Si(self):
-        return self._Si
-
-    @property
-    def De(self):
-        return torch.nn.Sigmoid()(self._De) * (self.param_range['De_max'] - \
-                self.param_range['De_min']) + self.param_range['De_min']
-
-    @property
-    def Di(self):
-        return torch.nn.Sigmoid()(self._Di) * (self.param_range['Di_max'] - \
-                self.param_range['Di_min']) + self.param_range['Di_min']
-
-    @property
-    def Ve(self):
-        return self._Ve
-
-    @property
-    def Vi(self):
-        return self._Vi
-
-    @property
-    def Ce(self):
-        return self._Ce
-
-    @property
-    def Ci(self):
-        return self._Ci
-
-    
     # BEGIN JAKE CODE
-    # Reconstructed full state-space parameters, assembled in the same
-    # channel-major interleaved order as x ([chan0_E, chan0_I, chan1_E, chan1_I, ...]).
-    # D/C/S/V use the same stack+flatten interleave as func_F()'s x_next; W/Gamma
-    # extend that to both matrix axes (interleave rows, then interleave columns).
-    # Useful for comparing the fitted model against W_truth/Gamma_truth.
+    # Full state-space parameters, in the same channel-major order as x
+    # (see pop_layout()). Useful for comparing against W_truth/Gamma_truth.
     @property
     def W(self):
-        n = self.n_chan
-        nPop = self.n_pop_per_chan
-        # Diagonal-only local connections (Wie: E<-I, Wii: I<-I) carry the inhibitory
-        # sign explicitly here, matching the -Wie/-Wii terms used in func_F().
-        col_E = torch.stack([self.Wee, self.Wei], dim=1).reshape(nPop * n, n)
-        col_I = torch.stack([-torch.diag(self.Wie), -torch.diag(self.Wii)], dim=1).reshape(nPop * n, n)
-        return torch.stack([col_E, col_I], dim=2).reshape(nPop * n, nPop * n)
+        return self._W_mask * torch.abs(self._W_raw) * self._pop_type[None,:]
+
+    @property
+    def G1(self):
+        return torch.abs(self._G1)
+
+    @property
+    def G2(self):
+        return torch.abs(self._G2)
 
     @property
     def Gamma(self):
-        n = self.n_chan
-        nPop = self.n_pop_per_chan
-        nS = self._nS
-        Gamma = torch.zeros(nPop * n, nPop * n, nS, dtype=self.Gammaee.dtype, device=self.device)
-        for i in range(nS):
-            col_E = torch.stack([self.Gammaee[:, :, i], self.Gammaei[:, :, i]], dim=1).reshape(nPop * n, n)
-            col_I = torch.stack([torch.diag(self.Gammaie[:, i]), torch.diag(self.Gammaii[:, i])], dim=1).reshape(nPop * n, n)
-            Gamma[:, :, i] = torch.stack([col_E, col_I], dim=2).reshape(nPop * n, nPop * n)
-        return Gamma
+        return self._W_mask[:,:,None] * torch.einsum('irk,rjk->ijk', self.G1, self.G2)
 
     @property
     def D(self):
-        return torch.stack([self.De, self.Di], dim=-1).flatten()
+        return torch.nn.Sigmoid()(self._D) * (self._D_max - self._D_min) + self._D_min
 
     @property
     def C(self):
-        return torch.stack([self.Ce, self.Ci], dim=-1).flatten()
+        return self._C
 
     @property
     def S(self):
-        return torch.stack([self.Se, self.Si], dim=-1).flatten()
+        return torch.where(self._S_fix, self._S0, self._S)
 
     @property
     def V(self):
-        return torch.stack([self.Ve, self.Vi], dim=-1).flatten()
+        return torch.where(self._V_fix, self._V0, self._V)
+
+    # Read-only E/I slices, kept so analysis code written for nPop=2 keeps working.
+    # Rows are targets and columns are sources, so Wei is E->I (I rows, E columns).
+    # Wee/Wei (and Gammaee/Gammaei) are (nChan*nPop/2 x nChan*nPop/2[ x n_HMM]).
+    # Wie/Wii (and Gammaie/Gammaii) are local-only, so they are returned as one
+    # (nPop/2 x nPop/2) block per channel: (nChan x nPop/2 x nPop/2[ x n_HMM]).
+    # For nPop=2 those blocks are 1x1 and get squeezed to the old (nChan[ x n_HMM])
+    # vectors. Wie/Wii are magnitudes (the W property carries the minus sign).
+    def _local_blocks(self, M):
+        # M: (nChan*nPairs x nChan*nPairs[ x n_HMM]), block-diagonal by channel
+        n_chan = self.n_chan
+        nPairs = self.n_pop_per_chan // 2
+        blocks = torch.diagonal(M.reshape(n_chan, nPairs, n_chan, nPairs, *M.shape[2:]), dim1=0, dim2=2)
+        blocks = torch.movedim(blocks, -1, 0)
+        if nPairs == 1:
+            blocks = blocks.reshape(n_chan, *M.shape[2:])
+        return blocks
+
+    @property
+    def Wee(self):
+        return self.W[self._E_idx][:, self._E_idx]
+
+    @property
+    def Wei(self):
+        return self.W[self._I_idx][:, self._E_idx]
+
+    @property
+    def Wie(self):
+        return self._local_blocks(-self.W[self._E_idx][:, self._I_idx])
+
+    @property
+    def Wii(self):
+        return self._local_blocks(-self.W[self._I_idx][:, self._I_idx])
+
+    @property
+    def Gammaee(self):
+        return self.Gamma[self._E_idx][:, self._E_idx]
+
+    @property
+    def Gammaei(self):
+        return self.Gamma[self._I_idx][:, self._E_idx]
+
+    @property
+    def Gammaie(self):
+        return self._local_blocks(self.Gamma[self._E_idx][:, self._I_idx])
+
+    @property
+    def Gammaii(self):
+        return self._local_blocks(self.Gamma[self._I_idx][:, self._I_idx])
+
+    # Old rank factors: target (k1) and source (k2) factors of the E/I populations.
+    # Gammaik1 keeps its old (rank x nI x n_HMM) orientation.
+    @property
+    def Gammaek1(self):
+        return self.G1[self._E_idx]
+
+    @property
+    def Gammaik1(self):
+        return self.G1[self._I_idx].permute(1, 0, 2)
+
+    @property
+    def Gammaek2(self):
+        return self.G2[:, self._E_idx]
+
+    @property
+    def Gammaik2(self):
+        return self.G2[:, self._I_idx]
+
+    @property
+    def Se(self):
+        return self.S[self._E_idx]
+
+    @property
+    def Si(self):
+        return self.S[self._I_idx]
+
+    @property
+    def De(self):
+        return self.D[self._E_idx]
+
+    @property
+    def Di(self):
+        return self.D[self._I_idx]
+
+    @property
+    def Ve(self):
+        return self.V[self._E_idx]
+
+    @property
+    def Vi(self):
+        return self.V[self._I_idx]
+
+    @property
+    def Ce(self):
+        return self.C[self._E_idx]
+
+    @property
+    def Ci(self):
+        return self.C[self._I_idx]
     # END JAKE CODE

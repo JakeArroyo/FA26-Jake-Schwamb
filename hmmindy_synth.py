@@ -10,6 +10,7 @@ torch._dynamo.config.capture_func_transforms = True
 
 # Custom modules
 from pymindy.dataset import create_synth_HMMINDy
+from pymindy.dataset.create_synth_data import pop_layout # JAKE
 from pymindy.training.hmmindy_core import HMMINDyCore
 from pymindy.training.utils import train_hmmindy_data_MSE
 
@@ -22,6 +23,9 @@ n_models = 20
 nChan = 20 # number of data channels
 nPop = 2 # number of populations per channel (typically even to balance E/I ratio)
 nS = 3 # number of modulation states
+
+# JAKE: channel-major E/I population indices ([e1 i1 e2 i2 ...] per channel)
+pop_type, is_E, E_idx, I_idx, chan_of = pop_layout(nChan, nPop)
 
 # Device
 device = "cpu"
@@ -95,7 +99,7 @@ for model_ind in range(n_models):
     tmp = create_synth_HMMINDy(nChan, nPop, nS)
     Gamma_ind_hist = tmp['mod_ind_hist']
 
-    model, train_info = train_hmmindy_data_MSE(data, init_model, n_batch, stack_interval,
+    model, train_info, mod_ind_fit = train_hmmindy_data_MSE(data, init_model, n_batch, stack_interval,
                                        warm_up_step, kf_step, rec_step, optimizer,
                                        P0, Gamma_ind_hist=Gamma_ind_hist,
                                        clipping_grad_norm=clipping_grad_norm,
@@ -111,8 +115,8 @@ for model_ind in range(n_models):
     #W_fit = np.hstack([np.vstack([Wee_fit, Wei_fit]), -np.vstack([np.diag(Wie_fit), np.diag(Wii_fit)])])
     # Compute W correlations
     corr_W = np.corrcoef(W_fit.flatten(), W_truth.flatten())[0,1]
-    corr_Wee = np.corrcoef(Wee_fit.flatten(), W_truth[0::nPop, 0::nPop].flatten())[0,1]
-    corr_Wei = np.corrcoef(Wei_fit.flatten(), W_truth[1::nPop, 0::nPop].flatten())[0,1]
+    corr_Wee = np.corrcoef(Wee_fit.flatten(), W_truth[np.ix_(E_idx, E_idx)].flatten())[0,1]
+    corr_Wei = np.corrcoef(Wei_fit.flatten(), W_truth[np.ix_(I_idx, E_idx)].flatten())[0,1]
     #corr_Wee = np.corrcoef(Wee_fit.flatten(), W_truth[:Wee_fit.shape[0], :Wee_fit.shape[1]].flatten())[0,1]
     #corr_Wei = np.corrcoef(Wei_fit.flatten(), W_truth[Wei_fit.shape[0]:, :Wei_fit.shape[1]].flatten())[0,1]
 
