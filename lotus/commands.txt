@@ -1,0 +1,32 @@
+# --- Upload code (images/ and runs/ excluded so local/old results never land on the cluster) ---
+cd ~/Desktop/school/Code/451/FA26-Jake
+rsync -av --exclude '.git' --exclude '__pycache__' --exclude '.DS_Store' --exclude 'images/' --exclude 'runs/' HM-MINDy-Jake arrjn-27@lotus.arc.rhodes.edu:~/
+
+# --- Run on the cluster ---
+ssh lotus
+cd ~/HM-MINDy-Jake
+rm -f images/*.svg            # clear old figures: anything in images/ afterwards came from this run
+bash lotus/submit_hmmindy.sh  # one array task per subject + an aggregate job; prints both job ids
+
+squeue -u $USER                                   # array tasks show as <arrayid>_<task>
+tail -f hmmindy_<arrayid>_<task>.*.out            # follow one subject's fit
+ls runs/<arrayid>/                                # one .pkl per finished subject
+
+# --- Check the jobs finished before downloading ---
+# Every array task and the aggregate job should be COMPLETED
+sacct -j <arrayid>,<aggid> --format=JobID,State,Elapsed,MaxRSS,ExitCode
+tail -5 hmmindy_agg_<aggid>.*.out                 # should end with "Finished aggregating runs/<arrayid> ..."
+
+# --- If some array tasks failed or timed out ---
+# The aggregate job then waits forever (DependencyNeverSatisfied), so cancel it, refit only the
+# failed tasks into the same run directory, then aggregate by hand:
+scancel <aggid>
+sbatch --array=3,7 --export=ALL,RUN_DIR=runs/<arrayid> lotus/run_hmmindy.sbatch
+sbatch --dependency=afterok:<new arrayid> --export=ALL,RUN_DIR=runs/<arrayid> lotus/aggregate_hmmindy.sbatch
+
+# --- Download results (run on your Mac) ---
+cd ~/Desktop/school/Code/451/FA26-Jake/HM-MINDy-Jake
+rm -f images/*.svg            # clear local copies so only this run's figures remain
+rsync -av arrjn-27@lotus.arc.rhodes.edu:~/HM-MINDy-Jake/images/ images/
+rsync -av arrjn-27@lotus.arc.rhodes.edu:'~/HM-MINDy-Jake/HM-MINDy_*_fit_*.pkl' .
+rsync -av arrjn-27@lotus.arc.rhodes.edu:'~/HM-MINDy-Jake/hmmindy_*.out' .
